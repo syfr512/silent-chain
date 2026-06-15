@@ -2,10 +2,14 @@
 # Jython 2.7 compatible
 # Authorized testing only.
 
-from burp import IBurpExtender, IHttpListener
-from java.io import PrintWriter
-from java.lang import Runnable, Thread
+from burp import IBurpExtender, IHttpListener, ITab
+from java.io import PrintWriter, BufferedReader, InputStreamReader, OutputStreamWriter
+from java.lang import Runnable, Thread, Exception as JavaException
+from java.net import URL
 from java.util.concurrent import LinkedBlockingQueue
+from javax.swing import JScrollPane, JTextArea, SwingUtilities, JPanel, JLabel, JRadioButton, ButtonGroup
+from java.awt import Component, BorderLayout, FlowLayout
+from java.awt.event import ActionListener
 
 import urllib2
 import json
@@ -17,6 +21,13 @@ import time
 # CONFIGURATION
 # =========================
 
+AI_MODE = "LOCAL" # Options: "CLOUD" or "LOCAL"
+
+# Local AI Configuration (Ollama)
+OLLAMA_ENDPOINT = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:1b"
+
+# Cloud AI Configuration (OpenAI)
 OPENAI_API_KEY = "PLACE_YOUR_SECRET_KEY_HERE"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 OPENAI_MODEL = "gpt-4o-mini"
@@ -57,7 +68,7 @@ INTERESTING_HEADERS = (
 )
 
 
-class BurpExtender(IBurpExtender, IHttpListener):
+class BurpExtender(IBurpExtender, IHttpListener, ITab):
 
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
@@ -66,6 +77,51 @@ class BurpExtender(IBurpExtender, IHttpListener):
         self.stderr = PrintWriter(callbacks.getStderr(), True)
 
         callbacks.setExtensionName("Silent Chain - Cloud API")
+        
+        # UI Setup
+        self.main_panel = JPanel(BorderLayout())
+        
+        # Top Panel
+        self.top_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        self.top_panel.add(JLabel("Execution Mode:"))
+        
+        self.radio_local = JRadioButton("Local (Ollama)")
+        self.radio_cloud = JRadioButton("Cloud (OpenAI)")
+        
+        mode_group = ButtonGroup()
+        mode_group.add(self.radio_local)
+        mode_group.add(self.radio_cloud)
+        
+        if AI_MODE == "LOCAL":
+            self.radio_local.setSelected(True)
+        else:
+            self.radio_cloud.setSelected(True)
+            
+        class ModeChangeListener(ActionListener):
+            def __init__(self, mode):
+                self.mode = mode
+            def actionPerformed(self, event):
+                global AI_MODE
+                AI_MODE = self.mode
+                
+        self.radio_local.addActionListener(ModeChangeListener("LOCAL"))
+        self.radio_cloud.addActionListener(ModeChangeListener("CLOUD"))
+        
+        self.top_panel.add(self.radio_local)
+        self.top_panel.add(self.radio_cloud)
+        
+        self.main_panel.add(self.top_panel, BorderLayout.NORTH)
+        
+        # Bottom Panel (Text Area)
+        self.log_area = JTextArea()
+        self.log_area.setEditable(False)
+        self.log_area.setLineWrap(True)
+        self.log_area.setWrapStyleWord(True)
+        self.scroll_pane = JScrollPane(self.log_area)
+        self.main_panel.add(self.scroll_pane, BorderLayout.CENTER)
+        
+        callbacks.addSuiteTab(self)
+        
         callbacks.registerHttpListener(self)
 
         self.queue = LinkedBlockingQueue(MAX_QUEUE_SIZE)
@@ -79,6 +135,24 @@ class BurpExtender(IBurpExtender, IHttpListener):
         self.stdout.println("[Silent Chain] AUTO_ALLOWLIST max hosts: " + str(MAX_HOSTS_AUTO_ALLOW))
         self.stdout.println("[Silent Chain] Worker thread started.")
         self.stdout.println("[Silent Chain] Replace OPENAI_API_KEY before running real scans.")
+
+    # ITab implementation
+    def getTabCaption(self):
+        return "Silent Chain"
+
+    def getUiComponent(self):
+        return self.main_panel
+
+    def append_to_ui(self, message):
+        class AppendTask(Runnable):
+            def __init__(self, text_area, text):
+                self.text_area = text_area
+                self.text = text
+            def run(self):
+                self.text_area.append(self.text + "\n")
+                self.text_area.setCaretPosition(self.text_area.getDocument().getLength())
+        
+        SwingUtilities.invokeLater(AppendTask(self.log_area, message))
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         try:
@@ -304,29 +378,81 @@ class SilentChainWorker(Runnable):
                 if delta < MIN_SECONDS_BETWEEN_API_CALLS:
                     time.sleep(MIN_SECONDS_BETWEEN_API_CALLS - delta)
 
-                result = self.call_openai(telemetry)
+                result = self.query_ai_backend(telemetry)
                 self.last_call = time.time()
 
-                out.println("")
-                out.println("========== Silent Chain Cloud Analysis ==========")
-                out.println("URL: " + str(telemetry.get("url", "")))
-                out.println(result)
-                out.println("=================================================")
-                out.println("")
+                log_entry = (
+                    "\n========== Silent Chain %s Analysis ==========\n" % AI_MODE +
+                    "URL: " + str(telemetry.get("url", "")) + "\n" +
+                    (result if result else "[Error] No result returned.") + "\n" +
+                    "=================================================\n"
+                )
+
+                # Print to standard output (extender console)
+                out.println(log_entry)
+                
+                # Print to the custom UI tab safely
+                self.extender.append_to_ui(log_entry)
 
             except Exception as e:
                 err.println("[Silent Chain] Worker error: " + str(e))
 
-    def call_openai(self, telemetry):
-        if OPENAI_API_KEY == "PLACE_YOUR_SECRET_KEY_HERE":
-            return "[Config Error] Set OPENAI_API_KEY at the top of the extension file."
+    def make_java_http_request(self, endpoint_url, payload_dict, headers=None):
+        if headers is None:
+            headers = {}
+        try:
+            url = URL(endpoint_url)
+            conn = url.openConnection()
+            conn.setRequestMethod("POST")
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Accept", "application/json")
+            for key, value in headers.items():
+                conn.setRequestProperty(key, value)
+            conn.setDoOutput(True)
+            conn.setConnectTimeout(10000)
+            conn.setReadTimeout(0)
+            
+            writer = OutputStreamWriter(conn.getOutputStream(), "UTF-8")
+            writer.write(json.dumps(payload_dict))
+            writer.flush()
+            writer.close()
+            
+            status_code = conn.getResponseCode()
+            if status_code >= 400:
+                reader = BufferedReader(InputStreamReader(conn.getErrorStream(), "UTF-8"))
+            else:
+                reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
+                
+            response_lines = []
+            line = reader.readLine()
+            while line is not None:
+                response_lines.append(line)
+                line = reader.readLine()
+            reader.close()
+            
+            response_data = "".join(response_lines)
+            
+            if status_code >= 400:
+                return None, "[HTTP Error %s] %s" % (status_code, response_data)
+                
+            return json.loads(response_data), None
+            
+        except JavaException as e:
+            return None, "[Java Network Exception] " + e.getMessage()
+        except Exception as e:
+            return None, "[Python Exception] " + str(e)
 
+    def query_ai_backend(self, telemetry):
         system_prompt = (
             "You are Silent Chain, a defensive web security analysis assistant. "
             "Analyze only authorized lab traffic. "
             "Return concise cybersecurity attack-path analysis for the observed request/response. "
             "Focus on likely vulnerabilities, evidence from telemetry, risk, and safe validation steps. "
-            "Do not provide destructive exploitation instructions, persistence, evasion, malware, or data theft guidance."
+            "Do not provide destructive exploitation instructions, persistence, evasion, malware, or data theft guidance. "
+            "CRITICAL FORMATTING RULES: "
+            "NEVER use Markdown syntax. Do not output asterisks (*), hashtags (#), or bolding. "
+            "Format your response as a professional plain-text corporate report. "
+            "Use clean spacing, proper indentations, and standard ASCII bullet points (-) or arrows (-->)."
         )
 
         user_prompt = (
@@ -336,50 +462,45 @@ class SilentChainWorker(Runnable):
             + json.dumps(telemetry, separators=(",", ":"))
         )
 
-        payload = {
-            "model": OPENAI_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.2,
-            "max_tokens": 700
-        }
+        if AI_MODE == "LOCAL":
+            # Ollama API format
+            payload = {
+                "model": OLLAMA_MODEL,
+                "prompt": system_prompt + "\n\n" + user_prompt,
+                "stream": False
+            }
+            
+            self.extender.stdout.println("[*] Waiting for local AI response (this may take a moment on CPU)...")
+            parsed, err = self.make_java_http_request(OLLAMA_ENDPOINT, payload)
+            if err:
+                return "[Ollama Error] " + err
+            if parsed and "response" in parsed:
+                return parsed["response"].strip()
+            return "[Ollama Error] Invalid response format"
 
-        data = json.dumps(payload)
+        elif AI_MODE == "CLOUD":
+            if OPENAI_API_KEY == "PLACE_YOUR_SECRET_KEY_HERE":
+                return "[Config Error] Set OPENAI_API_KEY at the top of the extension file."
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + OPENAI_API_KEY
-        }
+            payload = {
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 700
+            }
 
-        request = urllib2.Request(
-            OPENAI_ENDPOINT,
-            data,
-            headers
-        )
+            headers = {
+                "Authorization": "Bearer " + OPENAI_API_KEY
+            }
 
-        try:
-            try:
-                context = ssl.create_default_context()
-                response = urllib2.urlopen(request, timeout=API_TIMEOUT_SECONDS, context=context)
-            except TypeError:
-                response = urllib2.urlopen(request, timeout=API_TIMEOUT_SECONDS)
-
-            raw = response.read()
-            parsed = json.loads(raw)
-
-            return parsed["choices"][0]["message"]["content"].strip()
-
-        except urllib2.HTTPError as e:
-            try:
-                body = e.read()
-            except:
-                body = ""
-            return "[OpenAI HTTP Error] " + str(e.code) + " " + str(body)
-
-        except urllib2.URLError as e:
-            return "[OpenAI Network Error] " + str(e)
-
-        except Exception as e:
-            return "[OpenAI Parse/Runtime Error] " + str(e)
+            parsed, err = self.make_java_http_request(OPENAI_ENDPOINT, payload, headers)
+            if err:
+                return "[OpenAI Error] " + err
+            if parsed and "choices" in parsed and len(parsed["choices"]) > 0:
+                return parsed["choices"][0]["message"]["content"].strip()
+            return "[OpenAI Error] Invalid response format"
+            
+        return "[Config Error] Unknown AI_MODE: " + str(AI_MODE)
